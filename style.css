@@ -1,0 +1,54 @@
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; overflow: hidden; background: #1b1d22; color: #e9e9ec; font: 14px/1.4 system-ui, sans-serif; }
+#view { display: block; width: 100vw; height: 100vh; }
+
+#toolbar {
+  position: fixed; top: 12px; left: 12px; right: 12px;
+  display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
+  pointer-events: none;
+}
+#toolbar > * { pointer-events: auto; }
+.btn, .color {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 7px 12px; border: 1px solid #3a3e47; border-radius: 8px;
+  background: #262930cc; color: inherit; font: inherit; cursor: pointer;
+  backdrop-filter: blur(6px);
+}
+.btn:hover { background: #31353ecc; }
+.btn:disabled { opacity: .45; cursor: default; }
+.color input { width: 28px; height: 22px; padding: 0; border: none; background: none; cursor: pointer; }
+#info { color: #a7abb5; pointer-events: none; }
+
+#drop {
+  position: fixed; inset: 12px; display: none;
+  align-items: center; justify-content: center;
+  border: 2px dashed #e8a33d; border-radius: 16px;
+  background: #1b1d22cc; font-size: 22px; pointer-events: none;
+}
+body.dragging #drop { display: flex; }
+
+#panel {
+  position: fixed; top: 64px; right: 12px; width: 272px;
+  max-height: calc(100vh - 76px); overflow-y: auto;
+  padding: 10px 14px 14px; border: 1px solid #3a3e47; border-radius: 12px;
+  background: #262930e6; backdrop-filter: blur(6px);
+}
+#panel summary { cursor: pointer; font-weight: 600; padding: 4px 0 8px; }
+#panel .wide { width: 100%; justify-content: center; margin-top: 8px; }
+#panel .primary { background: #e8a33d; border-color: #e8a33d; color: #1b1d22; font-weight: 600; }
+#panel .primary:hover { background: #f0b456; }
+#preview {
+  display: block; width: 100%; height: auto; margin-top: 10px;
+  border-radius: 8px; background: #1b1d22;
+}
+#panel .row { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 10px; }
+#panel .row input[type=number], #panel select {
+  width: 130px; padding: 5px 8px; border: 1px solid #3a3e47; border-radius: 6px;
+  background: #1b1d22; color: inherit; font: inherit;
+}
+#panel .row input[type=range] { width: 130px; }
+.note { margin: 8px 0 0; color: #a7abb5; font-size: 12px; }
+
+@media (max-width: 600px) {
+  #panel { top: auto; bottom: 12px; left: 12px; right: 12px; width: auto; max-height: 55vh; }
+}
