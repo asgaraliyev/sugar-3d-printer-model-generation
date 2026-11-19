@@ -1,18 +1,10 @@
-// Image -> sugar printer G-code.
-// Machine rules copied from the manufacturer's files in models/ (Cura 15 style).
+// Layer masks -> printer G-code.
+// Machine rules copied from each printer's own files: Foodbot = models/*.gcode (Cura 15),
+// candy sugar machine = 664430.png.stl.*.gcode (iceman3d). Per-print values come from settings.js.
+import { printerOf } from './settings.js';
 
 export const CELL_MM = 0.1;          // mask resolution
-const BEAD_WIDTH = 0.6;              // mm, measured from models/*.gcode
-const FIRST_LAYER_Z = 0.4;
-const LAYER_HEIGHT = 0.45;
-const FILAMENT_AREA = Math.PI * 14 * 14; // filament_diameter: 28
-const PRINT_F = 900;
-const TRAVEL_F = 900;
-const RETRACT_F = 3000;
-const RETRACT_MM = 2;
-const RETRACT_MIN_TRAVEL = 1;        // mm; shorter travels skip retraction
-const CENTER_X = 100;
-const CENTER_Y = 100;
+const FAN_FULL_HEIGHT = 0.5;         // fan_full_height in the profile
 
 // imageData is already scaled to the mask grid (1 pixel = CELL_MM).
 export function buildMask({ data, width, height }, { mode = 'dark', threshold = 128, invert = false } = {}) {
@@ -31,10 +23,11 @@ export function buildMask({ data, width, height }, { mode = 'dark', threshold = 
   return mask;
 }
 
-// Chamfer (3-4) distance from each inside cell to the nearest outside cell, in mm.
-function distanceMap(mask, w, h) {
+// Chamfer (3-4) distance from each set cell to the nearest unset cell, in mm.
+// edge is what lies beyond the grid: 0 = unset, 1e9 = far away.
+function distanceMap(mask, w, h, edge = 0) {
   const d = new Float32Array(w * h);
-  const at = (x, y) => (x < 0 || y < 0 || x >= w || y >= h ? 0 : d[y * w + x]);
+  const at = (x, y) => (x < 0 || y < 0 || x >= w || y >= h ? edge : d[y * w + x]);
   for (let i = 0; i < d.length; i++) d[i] = mask[i] ? 1e9 : 0;
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
@@ -55,6 +48,7 @@ function distanceMap(mask, w, h) {
 }
 
 // Boundary loops of a binary grid, in cell-corner coordinates.
+// Outer boundaries come out with positive area(), holes with negative.
 function traceContours(inside, w, h) {
   const isIn = (x, y) => x >= 0 && y >= 0 && x < w && y < h && inside[y * w + x];
   const key = (x, y) => y * (w + 1) + x;
@@ -98,6 +92,15 @@ function traceContours(inside, w, h) {
   return loops;
 }
 
+function area(pts) {
+  let a = 0;
+  for (let i = 0; i < pts.length; i++) {
+    const p = pts[i], q = pts[(i + 1) % pts.length];
+    a += p[0] * q[1] - q[0] * p[1];
+  }
+  return a / 2;
+}
+
 function simplify(pts, tol) {
   if (pts.length < 3) return pts;
   const keep = new Uint8Array(pts.length);
@@ -139,12 +142,116 @@ function polyLength(pts, closed) {
   return len;
 }
 
+const cleanLoops = (loops) => loops
+  .map((loop) => simplifyLoop(loop, 0.7))
+  .filter((loop) => polyLength(loop, false) * CELL_MM >= 1);
+
+// Loop i runs along dist = bead * (i + 0.5), so the outer one touches the edge.
+function wallLoops(dist, w, h, bead, count) {
+  const walls = [];
+  const m = new Uint8Array(w * h);
+  for (let i = 0; i < count; i++) {
+    const t = bead * (i + 0.5);
+    let any = 0;
+    for (let k = 0; k < dist.length; k++) any |= m[k] = dist[k] > t ? 1 : 0;
+    if (!any) break;
+    walls.push(cleanLoops(traceContours(m, w, h)));
+  }
+  return walls; // [outer, ..., inner]
+}
+
+// Strokes thinner than the bead never reach dist > bead/2, so wallLoops skips them.
+// Grow each such stroke to just over one bead wide so a wall loop runs along it.
+function widenThin(mask, dist, w, h, bead) {
+  const r = bead / 2;
+  // A core only just past r breaks into scraps that cleanLoops drops, so demand a margin.
+  const notCore = new Uint8Array(w * h);
+  for (let k = 0; k < notCore.length; k++) notCore[k] = dist[k] > r + 2 * CELL_MM ? 0 : 1;
+  const toCore = distanceMap(notCore, w, h, 1e9);
+  const lost = new Uint8Array(w * h);
+  for (let k = 0; k < lost.length; k++) lost[k] = mask[k] && toCore[k] > r + CELL_MM ? 1 : 0;
+
+  const out = mask.slice();
+  const seen = new Uint8Array(w * h);
+  for (let s = 0; s < lost.length; s++) {
+    if (!lost[s] || seen[s]) continue;
+    const comp = [s];
+    seen[s] = 1;
+    let x0 = w, x1 = 0, y0 = h, y1 = 0, half = 0;
+    for (let i = 0; i < comp.length; i++) {
+      const k = comp[i], x = k % w, y = (k - x) / w;
+      x0 = Math.min(x0, x); x1 = Math.max(x1, x); y0 = Math.min(y0, y); y1 = Math.max(y1, y);
+      half = Math.max(half, dist[k]);
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          const nx = x + dx, ny = y + dy, n = ny * w + nx;
+          if (nx >= 0 && ny >= 0 && nx < w && ny < h && lost[n] && !seen[n]) { seen[n] = 1; comp.push(n); }
+        }
+      }
+    }
+    // Leftover corners of thick shapes are smaller than this; leave them alone.
+    if (Math.max(x1 - x0, y1 - y0) * CELL_MM < bead * 0.6) continue;
+    const g = Math.max(0, Math.ceil((r - half) / CELL_MM)) + 3; // a few cells past one bead, or the loop is a sliver that breaks up
+    for (const k of comp) {
+      const x = k % w, y = (k - x) / w;
+      for (let dy = -g; dy <= g; dy++) {
+        for (let dx = -g; dx <= g; dx++) {
+          const nx = x + dx, ny = y + dy;
+          if (dx * dx + dy * dy <= g * g && nx >= 0 && ny >= 0 && nx < w && ny < h) out[ny * w + nx] = 1;
+        }
+      }
+    }
+  }
+  return out;
+}
+
+// Where a loop's two sides lie closer than two beads they overlap, so scale its flow down
+// (0.5 when they coincide, as on a widened thin stroke).
+function wallFlow(dist, w, h, bead) {
+  const R = Math.round(bead / CELL_MM);
+  return (cx, cy) => {
+    const x = Math.round(cx), y = Math.round(cy);
+    let max = 0;
+    for (let dy = -R; dy <= R; dy++) {
+      for (let dx = -R; dx <= R; dx++) {
+        const nx = x + dx, ny = y + dy;
+        if (dx * dx + dy * dy <= R * R && nx >= 0 && ny >= 0 && nx < w && ny < h) max = Math.max(max, dist[ny * w + nx]);
+      }
+    }
+    const inner = Math.max(0, 2 * max - bead);
+    return Math.min(1, (inner + bead) / (2 * bead));
+  };
+}
+
+// Brim loops around the outside of the first layer, outermost first.
+// Returned in the layer's cell coordinates (may be negative).
+function brimLoops(mask, w, h, bead, lines) {
+  const p = Math.ceil((lines * bead + 1) / CELL_MM);
+  const W = w + 2 * p, H = h + 2 * p;
+  const far = new Uint8Array(W * H).fill(1);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) if (mask[y * w + x]) far[(y + p) * W + x + p] = 0;
+  }
+  const d = distanceMap(far, W, H, 1e9);
+  const region = new Uint8Array(W * H);
+  const loops = [];
+  for (let i = lines - 1; i >= 0; i--) {
+    const t = bead * (i + 0.5);
+    for (let k = 0; k < d.length; k++) region[k] = d[k] < t ? 1 : 0;
+    for (const loop of cleanLoops(traceContours(region, W, H))) {
+      if (area(loop) > 0) loops.push(loop.map(([x, y]) => [x - p, y - p]));
+    }
+  }
+  return loops;
+}
+
 // Scanline fill runs (cell-centre coordinates), ordered as a zigzag.
-function fillRuns(inside, w, h, vertical) {
-  const step = Math.round(BEAD_WIDTH / CELL_MM);
+// Lines sit on a fixed grid so sparse fill stacks up between layers.
+function fillRuns(inside, w, h, vertical, spacingMm, minMm) {
+  const step = Math.max(1, Math.round(spacingMm / CELL_MM));
   const lines = vertical ? w : h;
   const along = vertical ? h : w;
-  const minCells = BEAD_WIDTH / CELL_MM;
+  const minCells = minMm / CELL_MM;
   const runs = [];
   let flip = false;
   for (let l = Math.floor(step / 2); l < lines; l += step) {
@@ -168,97 +275,192 @@ function fillRuns(inside, w, h, vertical) {
   return runs;
 }
 
-export function maskToGcode(mask, w, h, { layers = 1, name = 'image' } = {}) {
-  const dist = distanceMap(mask, w, h);
-  const wallMask = new Uint8Array(w * h);
-  const fillMask = new Uint8Array(w * h);
-  for (let i = 0; i < dist.length; i++) {
-    wallMask[i] = dist[i] > BEAD_WIDTH / 2 ? 1 : 0;
-    fillMask[i] = dist[i] > BEAD_WIDTH * 1.5 - 0.05 ? 1 : 0;
+export function layerCount(heightMm, s) {
+  if (heightMm <= 0) return 0;
+  return 1 + Math.max(0, Math.ceil((heightMm - s.firstLayer) / s.layerHeight - 1e-6));
+}
+
+export function layerZ(L, s) {
+  return s.firstLayer + L * s.layerHeight;
+}
+
+// getMask(L) -> Uint8Array(w * h), grid y down, centred on the bed.
+export function buildGcode({ layers, w, h, getMask, settings: s, name = 'model', onProgress }) {
+  const P = printerOf(s);
+  const wMm = w * CELL_MM, hMm = h * CELL_MM, zMm = layerZ(layers - 1, s);
+  if (wMm > P.maxX + 1e-6 || hMm > P.maxY + 1e-6 || zMm > P.maxZ + 1e-6) {
+    return { error: `Model çox böyükdür: ${wMm.toFixed(0)} × ${hMm.toFixed(0)} × ${zMm.toFixed(1)} mm (maks. ${P.maxX} × ${P.maxY} × ${P.maxZ})` };
   }
 
-  const walls = traceContours(wallMask, w, h)
-    .map((loop) => simplifyLoop(loop, 0.7))
-    .filter((loop) => polyLength(loop, false) * CELL_MM >= 1);
-  const fills = [fillRuns(fillMask, w, h, false), fillRuns(fillMask, w, h, true)];
+  const cura = P.dialect === 'cura15';
+  const bead = s.nozzle;
+  const filamentArea = Math.PI * (P.filamentDiameter / 2) ** 2;
+  const wallCount = Math.max(1, Math.round(s.wallThickness / bead));
+  const solidCount = Math.round(s.solidThickness / s.layerHeight);
+  const retract = s.retractAmount > 0;
+  const fillEdge = bead * (wallCount + 0.5 - s.fillOverlap / 100) - 0.05;
+  const sparseSpacing = s.fillDensity > 0 ? bead / (s.fillDensity / 100) : Infinity;
+  const printF = s.printSpeed * 60, firstF = s.firstLayerSpeed * 60;
+  const travelF = s.travelSpeed * 60, retractF = s.retractSpeed * 60;
+
+  const cache = new Map();
+  const maskAt = (L) => {
+    if (L < 0 || L >= layers) return null;
+    if (!cache.has(L)) cache.set(L, getMask(L));
+    return cache.get(L);
+  };
 
   // Grid (cells, y down) -> machine mm (y up), centred on the bed.
-  const wMm = w * CELL_MM, hMm = h * CELL_MM;
-  const toX = (cx) => CENTER_X - wMm / 2 + cx * CELL_MM;
-  const toY = (cy) => CENTER_Y + hMm / 2 - cy * CELL_MM;
+  const toX = (cx) => P.centerX - wMm / 2 + cx * CELL_MM;
+  const toY = (cy) => P.centerY + hMm / 2 - cy * CELL_MM;
 
   const body = [];
-  let x = CENTER_X, y = CENTER_Y, z = 6, e = 0, f = 0;
-  let retracted = true; // start block ends with a retract
-  let time = 0;
+  let x = P.centerX, y = P.centerY, z = cura ? 6 : 2, e = 0, f = 0;
+  let retracted = retract; // the Cura start block ends with a retract
+  let time = 0, walls0 = 0, printed = false, fanOn = false;
   const n = (v, d = 3) => v.toFixed(d);
 
+  // Both machines' files only repeat F when it changes.
   const travel = (tx, ty, tz) => {
     const d = Math.hypot(tx - x, ty - y);
-    if (!retracted && (d > RETRACT_MIN_TRAVEL || tz !== undefined)) {
-      body.push(`G1 F${RETRACT_F} E${n(e - RETRACT_MM, 5)}`);
+    if (retract && !retracted && (d > s.retractMinTravel || tz !== undefined)) {
+      body.push(`G1 F${retractF} E${n(e - s.retractAmount, 5)}`);
       retracted = true;
+      f = retractF;
     }
-    body.push(`G0 F${TRAVEL_F} X${n(tx)} Y${n(ty)}${tz !== undefined ? ` Z${n(tz)}` : ''}`);
-    f = TRAVEL_F;
-    time += d / (TRAVEL_F / 60);
+    body.push(`G0${f !== travelF ? ` F${travelF}` : ''} X${n(tx)} Y${n(ty)}${tz !== undefined ? ` Z${n(tz)}` : ''}`);
+    f = travelF;
+    time += d / s.travelSpeed;
     x = tx; y = ty;
     if (tz !== undefined) z = tz;
   };
-  const extrude = (tx, ty, layerH) => {
+  const extrude = (tx, ty, layerH, speedF, flow = 1) => {
     if (retracted) {
-      body.push(`G1 F${RETRACT_F} E${n(e, 5)}`);
+      body.push(`G1 F${retractF} E${n(e, 5)}`);
       retracted = false;
-      f = RETRACT_F;
+      f = retractF;
     }
     const d = Math.hypot(tx - x, ty - y);
     if (d < 1e-4) return;
-    e += (d * BEAD_WIDTH * layerH) / FILAMENT_AREA;
-    body.push(`G1${f !== PRINT_F ? ` F${PRINT_F}` : ''} X${n(tx)} Y${n(ty)} E${n(e, 5)}`);
-    f = PRINT_F;
-    time += d / (PRINT_F / 60);
+    e += (d * bead * layerH * flow) / filamentArea;
+    body.push(`G1${f !== speedF ? ` F${speedF}` : ''} X${n(tx)} Y${n(ty)} E${n(e, 5)}`);
+    f = speedF;
+    time += d / (speedF / 60);
     x = tx; y = ty;
+    printed = true;
   };
 
   body.push(`;Layer count: ${layers}`);
   for (let L = 0; L < layers; L++) {
-    const layerZ = FIRST_LAYER_Z + L * LAYER_HEIGHT;
-    const layerH = L === 0 ? FIRST_LAYER_Z : LAYER_HEIGHT;
+    const mask = maskAt(L);
+    const zL = layerZ(L, s);
+    const layerH = L === 0 ? s.firstLayer : s.layerHeight;
+    const speedF = L === 0 && !P.flat ? firstF : printF; // a flat print's one layer uses the print speed
     let first = true;
     body.push(`;LAYER:${L}`);
-    if (L === 0) {
+    if (!cura) {
+      if (L === 0) body.push(';M107');
+    } else if (!fanOn && zL >= FAN_FULL_HEIGHT - 1e-6) {
+      body.push('M106 S255');
+      fanOn = true;
+    } else if (L === 0) {
       body.push('M107');
-      body.push(`G1 F${RETRACT_F} E${n(e - RETRACT_MM, 5)}`);
+    }
+    if (cura && L === 0 && retract) {
+      body.push(`G1 F${retractF} E${n(e - s.retractAmount, 5)}`);
+      f = retractF;
     }
     const moveTo = (px, py) => {
-      travel(px, py, first ? layerZ : undefined);
+      travel(px, py, first ? zL : undefined);
       first = false;
     };
+    const loop = (pts, flowAt) => {
+      moveTo(toX(pts[0][0]), toY(pts[0][1]));
+      if (s.loopDwell > 0) { // let the sugar reach the plate before moving
+        body.push(`G4 P${Math.round(s.loopDwell * 1000)}`);
+        time += s.loopDwell;
+      }
+      for (let i = 1; i <= pts.length; i++) {
+        const p = pts[i % pts.length], q = pts[i - 1];
+        const flow = flowAt ? flowAt((p[0] + q[0]) / 2, (p[1] + q[1]) / 2) : 1;
+        extrude(toX(p[0]), toY(p[1]), layerH, speedF, flow);
+      }
+    };
+    const lines = (runs) => {
+      for (const [[ax, ay], [bx, by]] of runs) {
+        moveTo(toX(ax), toY(ay));
+        extrude(toX(bx), toY(by), layerH, speedF);
+      }
+    };
 
-    if (walls.length) body.push(';TYPE:WALL-OUTER');
-    for (const loop of walls) {
-      moveTo(toX(loop[0][0]), toY(loop[0][1]));
-      for (let i = 1; i < loop.length; i++) extrude(toX(loop[i][0]), toY(loop[i][1]), layerH);
-    }
+    const dist = distanceMap(mask, w, h);
+    // The candy machine prints outlines only, so thin strokes would be lost entirely.
+    const wallDist = P.flat ? distanceMap(widenThin(mask, dist, w, h, bead), w, h) : dist;
+    const flowAt = P.flat ? wallFlow(wallDist, w, h, bead) : null;
+    const walls = wallLoops(wallDist, w, h, bead, wallCount);
+    if (L === 0) walls0 = walls.reduce((sum, ws) => sum + ws.length, 0);
 
-    const runs = fills[L % 2];
-    if (runs.length) body.push(';TYPE:FILL');
-    for (const [[ax, ay], [bx, by]] of runs) {
-      moveTo(toX(ax), toY(ay));
-      extrude(toX(bx), toY(by), layerH);
+    // Solid where any of the solidCount layers above or below is missing.
+    const fill = new Uint8Array(w * h);
+    const cover = new Uint8Array(w * h);
+    for (let i = 0; i < fill.length; i++) cover[i] = fill[i] = dist[i] > fillEdge ? 1 : 0;
+    for (let k = 1; k <= solidCount; k++) {
+      for (const m of [maskAt(L - k), maskAt(L + k)]) {
+        if (!m) { cover.fill(0); break; }
+        for (let i = 0; i < cover.length; i++) cover[i] &= m[i];
+      }
     }
+    const solid = new Uint8Array(w * h);
+    for (let i = 0; i < fill.length; i++) solid[i] = fill[i] & (cover[i] ^ 1);
+    const vertical = L % 2 === 1;
+
+    if (L === 0 && s.brim) {
+      const brim = brimLoops(mask, w, h, bead, s.brimLines);
+      if (brim.length) body.push(';TYPE:SKIRT');
+      for (const b of brim) loop(b);
+    }
+    const sparse = Number.isFinite(sparseSpacing) ? fillRuns(cover, w, h, vertical, sparseSpacing, bead) : [];
+    if (sparse.length) body.push(';TYPE:FILL');
+    lines(sparse);
+    for (let i = walls.length - 1; i >= 0; i--) {
+      if (walls[i].length) body.push(i === 0 ? ';TYPE:WALL-OUTER' : ';TYPE:WALL-INNER');
+      for (const wl of walls[i]) loop(wl, flowAt);
+    }
+    const skin = fillRuns(solid, w, h, vertical, bead, bead);
+    if (skin.length) body.push(';TYPE:SKIN');
+    lines(skin);
+
+    for (const k of cache.keys()) if (k < L - solidCount) cache.delete(k);
+    onProgress?.((L + 1) / layers);
   }
 
   const filamentMm = e;
-  const grams = ((filamentMm * FILAMENT_AREA) / 1000) * 0.9;
+  const grams = ((filamentMm * filamentArea) / 1000) * 0.9;
   const minutes = Math.max(1, Math.round(time / 60));
 
+  const info = {
+    s, P, name, wMm, hMm, zMm, wallCount, solidCount, minutes, grams, filamentMm,
+    endE: e, endX: x, endY: y, endZ: z, retractF, travelF,
+  };
+  const { header, footer, eol } = cura ? cura15Blocks(info) : icemanBlocks(info);
+
+  return {
+    gcode: [...header, ...body, ...footer].join(eol), // line endings like each machine's own files
+    stats: {
+      widthMm: wMm, heightMm: hMm, zMm, layers, minutes, grams, walls: walls0,
+      empty: !printed,
+    },
+  };
+}
+
+// Start/end blocks of the Cura profile in models/*.gcode (CRLF).
+function cura15Blocks({ s, P, name, wMm, hMm, zMm, wallCount, solidCount, minutes, grams, filamentMm, endE, endX, endY, endZ, retractF, travelF }) {
   const header = [
     ';images: ?vmd5?',
-    `;settings: layer_height: ${LAYER_HEIGHT}`,
-    ';settings: fill_density: 100',
-    ';settings: travel_speed: 15',
-    ';settings: bottom_layer_speed: 15',
+    `;settings: layer_height: ${s.layerHeight}`,
+    `;settings: fill_density: ${s.fillDensity}`,
+    `;settings: travel_speed: ${s.travelSpeed}`,
+    `;settings: bottom_layer_speed: ${s.firstLayerSpeed}`,
     ';settings: support_angle: 30',
     ';settings: suppor_surface: ?suppor_surface?',
     ';settings: support_fill_rate: 30',
@@ -267,16 +469,17 @@ export function maskToGcode(mask, w, h, { layers = 1, name = 'image' } = {}) {
     ';settings: solid_layer_count: ?solid_layer_count?',
     ';settings: wall_count: ?wall_count?',
     ';settings: retraction_enable: 1',
-    ';settings: retraction_speed: 50',
-    `;settings: retraction_amount: ${RETRACT_MM}`,
-    ';settings: print_speed: 25',
-    ';settings: filament_diameter: 28',
+    `;settings: retraction_speed: ${s.retractSpeed}`,
+    `;settings: retraction_amount: ${s.retractAmount}`,
+    `;settings: print_speed: ${s.printSpeed}`,
+    `;settings: filament_diameter: ${P.filamentDiameter}`,
     ';settings: support: 0',
-    ';settings: platform_adhesion: 0',
+    `;settings: platform_adhesion: ${s.brim ? 'Brim' : 0}`,
     `;Print time: ${minutes} minutes`,
     `;Filament used: ${(filamentMm / 1000).toFixed(3)}m ${grams.toFixed(1)}g`,
     ';Filament cost: None',
-    `;Source image: ${name} (${wMm.toFixed(1)} x ${hMm.toFixed(1)} mm)`,
+    `;Source: ${name} (${wMm.toFixed(1)} x ${hMm.toFixed(1)} x ${zMm.toFixed(2)} mm)`,
+    `;Nozzle: ${s.nozzle} mm, walls: ${wallCount}, solid layers: ${solidCount}, fill overlap: ${s.fillOverlap}%`,
     ';M190 S0 ;Uncomment to add your own bed temperature line',
     ';M109 S0 ;Uncomment to add your own temperature line',
     'G21        ;metric values',
@@ -299,8 +502,8 @@ export function maskToGcode(mask, w, h, { layers = 1, name = 'image' } = {}) {
 
   const footer = [
     'M107',
-    `G1 F${RETRACT_F} E${n(e - RETRACT_MM, 5)}`,
-    `G0 F${TRAVEL_F} X${n(x)} Y${n(y)} Z${n(z + 5)}`,
+    `G1 F${retractF} E${(endE - s.retractAmount).toFixed(5)}`,
+    `G0 F${travelF} X${endX.toFixed(3)} Y${endY.toFixed(3)} Z${(endZ + 5).toFixed(3)}`,
     'G91',
     'G28 Y0                             ;move X/Y to min endstops, so the head is out of the way',
     'G1 E-3 F300                            ;retract the filament a bit before lifting the nozzle, to release some of the pressure',
@@ -308,13 +511,58 @@ export function maskToGcode(mask, w, h, { layers = 1, name = 'image' } = {}) {
     'G90                         ;absolute positioning',
     '',
   ];
+  return { header, footer, eol: '\r\n' };
+}
 
-  return {
-    gcode: [...header, ...body, ...footer].join('\r\n'), // CRLF like the machine's own files
-    stats: {
-      widthMm: wMm, heightMm: hMm, layers, minutes, grams,
-      walls: walls.length, fillLines: fills[0].length,
-      empty: walls.length === 0 && fills[0].length === 0,
-    },
-  };
+// Blocks of the candy sugar machine's file 664430.png.stl.*.gcode (iceman3d, LF).
+// The M100 line is copied verbatim; what it controls is unknown.
+function icemanBlocks({ s, P, wMm, hMm, zMm, wallCount, solidCount }) {
+  const header = [
+    ';Generated with iceman3d_SteamEngine DEV-15.04.2',
+    'M100 L2.00 F-133000 T78         M572       ',
+    `;Model size:X${wMm.toFixed(2)} Y${hMm.toFixed(2)} Z${zMm.toFixed(2)}`,
+    ';id: 0',
+    `;settings: layer_height: ${s.layerHeight.toFixed(1)}`,
+    `;settings: fill_density: ${s.fillDensity}`,
+    `;settings: travel_speed: ${s.travelSpeed}`,
+    `;settings: bottom_layer_speed: ${s.firstLayerSpeed}`,
+    ';settings: support_angle: 45',
+    ';settings: suppor_surface: 5',
+    ';settings: support_fill_rate: 10',
+    ';settings: support_xy_distance: 2',
+    ';settings: support_z_distance: 0.15',
+    `;settings: solid_layer_count: ${solidCount}`,
+    `;settings: wall_count: ${wallCount}`,
+    ';settings: retraction_enable: 1',
+    `;settings: retraction_speed: ${s.retractSpeed}`,
+    `;settings: retraction_amount: ${s.retractAmount.toFixed(1)}`,
+    `;settings: print_speed: ${s.printSpeed}`,
+    `;settings: filament_diameter: ${P.filamentDiameter}`,
+    `;settings: nozzle_size: ${s.nozzle}`,
+    ';settings: support: None',
+    `;settings: platform_adhesion: ${s.brim ? 'Brim' : 'None'}`,
+    ...(s.temp > 0 ? [`M104 S${s.temp}`] : []), // heats while homing
+    'G90',
+    'G28 X Y F2400',
+    'G0 X90 Y320 F3000',
+    'G28 Z',
+    ...(s.temp > 0 ? [`M109 S${s.temp}`] : []),
+    'G92 E0',
+    'G1 Z2 E8 F500',
+    ...(s.startDwell > 0 ? [`G4 P${Math.round(s.startDwell * 1000)}`] : []), // sugar starts flowing
+    'G92 E0',
+    ';M107',
+  ];
+
+  const footer = [
+    'M106 S255',
+    ...(s.endDwell > 0 ? [`G4 P${Math.round(s.endDwell * 1000)}`] : []), // cool under the fan before moving out
+    'G92 E0',
+    'G1 Z0 E-10 F500',
+    'G92 E0',
+    'G28 X Y F2400',
+    'G0 Y200 F1000',
+    '',
+  ];
+  return { header, footer, eol: '\n' };
 }

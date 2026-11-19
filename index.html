@@ -27,47 +27,86 @@
       Rəng
       <input id="color" type="color" value="#e8a33d">
     </label>
-    <span id="info">G-code və ya şəkil faylını bura atın</span>
+    <span id="info">G-code, şəkil və ya STL faylını bura atın</span>
   </div>
 
   <details id="panel" open>
-    <summary>Şəkildən G-code</summary>
+    <summary>G-code yarat</summary>
 
-    <label class="btn wide">
-      Şəkil yüklə
-      <input id="image" type="file" accept="image/png,image/jpeg,image/webp,image/gif" hidden>
-    </label>
+    <p class="group">Mənbə</p>
+    <div class="pair">
+      <label class="btn">
+        Şəkil yüklə
+        <input id="image" type="file" accept="image/png,image/jpeg,image/webp,image/gif" hidden>
+      </label>
+      <label class="btn">
+        STL yüklə
+        <input id="stl" type="file" accept=".stl" hidden>
+      </label>
+    </div>
 
-    <canvas id="preview" width="240" height="240"></canvas>
-    <p id="previewNote" class="note">Hələ şəkil yoxdur</p>
+    <div id="imageOpts">
+      <canvas id="preview" width="240" height="240"></canvas>
+      <p id="previewNote" class="note">Hələ şəkil yoxdur</p>
 
+      <div class="row">
+        <label for="width">En (mm)</label>
+        <input id="width" type="number" min="5" max="150" step="1" value="40">
+      </div>
+      <button id="fitMax" class="btn wide">Ən böyük ölçü</button>
+      <div class="row">
+        <label for="layers">Qat sayı</label>
+        <input id="layers" type="number" min="1" max="10" step="1" value="1">
+      </div>
+      <div class="row">
+        <label for="mode">Şəkər olsun</label>
+        <select id="mode">
+          <option value="dark">Tünd hissələr</option>
+          <option value="alpha">Şəffaf olmayan hissə</option>
+        </select>
+      </div>
+      <div class="row" id="thresholdRow">
+        <label for="threshold">Həssaslıq</label>
+        <input id="threshold" type="range" min="1" max="254" value="128">
+      </div>
+      <div class="row">
+        <label for="invert">Tərsinə çevir</label>
+        <input id="invert" type="checkbox">
+      </div>
+    </div>
+
+    <div id="stlOpts" hidden>
+      <p id="stlNote" class="note"></p>
+      <div class="row">
+        <label for="stlSize">Ən uzun tərəf (mm)</label>
+        <input id="stlSize" type="number" min="5" max="150" step="1" value="40">
+      </div>
+      <div class="row">
+        <span>Döndər 90°</span>
+        <span class="rot">
+          <button class="btn" data-axis="x">X</button>
+          <button class="btn" data-axis="y">Y</button>
+          <button class="btn" data-axis="z">Z</button>
+        </span>
+      </div>
+    </div>
+
+    <p class="group">Çap ayarları</p>
     <div class="row">
-      <label for="width">En (mm)</label>
-      <input id="width" type="number" min="5" max="150" step="1" value="40">
+      <label for="printer">Printer</label>
+      <select id="printer"></select>
     </div>
     <div class="row">
-      <label for="layers">Qat sayı</label>
-      <input id="layers" type="number" min="1" max="10" step="1" value="1">
+      <label for="material">Material</label>
+      <select id="material"></select>
     </div>
-    <div class="row">
-      <label for="mode">Şəkər olsun</label>
-      <select id="mode">
-        <option value="dark">Tünd hissələr</option>
-        <option value="alpha">Şəffaf olmayan hissə</option>
-      </select>
-    </div>
-    <div class="row" id="thresholdRow">
-      <label for="threshold">Həssaslıq</label>
-      <input id="threshold" type="range" min="1" max="254" value="128">
-    </div>
-    <div class="row">
-      <label for="invert">Tərsinə çevir</label>
-      <input id="invert" type="checkbox">
-    </div>
+    <p id="materialNote" class="note"></p>
+    <div id="settings"></div>
+    <button id="reset" class="btn wide">Standarta qaytar</button>
 
     <button id="generate" class="btn wide primary" disabled>G-code yarat</button>
     <button id="download" class="btn wide" disabled>Endir</button>
-    <p class="note">0.6 mm-dən incə detallar çap olunmur. İlk dəfə kiçik ölçü və 1 qatla sınayın.</p>
+    <p class="note">Başlıqdan incə detallar çap olunmur. İlk dəfə kiçik ölçü və az qatla sınayın. Temperaturu printerin Temp menyusunda qoyun.</p>
   </details>
 
   <div id="drop">Faylı bura atın</div>
